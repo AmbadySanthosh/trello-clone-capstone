@@ -1,0 +1,346 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+    <div class="mb-3">
+        <a href="{{ url_for('view_board', board_id=board.id) }}" class="btn btn-secondary btn-sm">
+            <i class="fas fa-arrow-left me-1"></i>Back to Board
+        </a>
+        <a href="{{ url_for('view_board', board_id=board.id) }}" class="btn btn-outline-secondary btn-sm ms-2">
+            <i class="fas fa-th-large me-1"></i>{{ board.name }}
+        </a>
+    </div>
+    
+    <div class="row">
+        <!-- Main Task Details Column -->
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header bg-primary text-white">
+                    <h4 class="mb-0">
+                        <i class="fas fa-tasks me-2"></i>{{ task.title }}
+                        {% if task.completed_at %}
+                        <span class="badge bg-success ms-2">Completed</span>
+                        {% elif task.is_overdue() %}
+                        <span class="badge bg-danger ms-2">Overdue!</span>
+                        {% endif %}
+                    </h4>
+                </div>
+                <div class="card-body">
+                    <div class="mb-3">
+                        <span class="badge bg-{{ 'danger' if task.priority == 'high' else 'warning' if task.priority == 'medium' else 'success' }} fs-6">
+                            <i class="fas fa-flag me-1"></i>{{ task.priority.upper() }} Priority
+                        </span>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <h6><i class="fas fa-align-left me-2"></i>Description</h6>
+                        <p class="text-muted">{{ task.description or 'No description provided.' }}</p>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <h6><i class="fas fa-calendar-alt me-2"></i>Due Date</h6>
+                        {% if task.due_date %}
+                            <div class="alert alert-{{ 'danger' if task.is_overdue() and not task.completed_at else 'info' }}">
+                                <i class="fas fa-clock me-2"></i>
+                                {{ task.due_date.strftime('%B %d, %Y at %I:%M %p') }}
+                                {% if task.is_overdue() and not task.completed_at %}
+                                    <strong class="ms-2">- OVERDUE! Please complete this task.</strong>
+                                {% endif %}
+                            </div>
+                        {% else %}
+                            <p class="text-muted">No due date set. <a href="#" onclick="showDueDateModal()">Add due date</a></p>
+                        {% endif %}
+                    </div>
+                    
+                    <div class="mb-4">
+                        <h6><i class="fas fa-paperclip me-2"></i>Attachments</h6>
+                        <div id="attachments-list" class="mb-2"></div>
+                        <div class="mt-2">
+                            <input type="file" id="fileInput" class="form-control mb-2" multiple>
+                            <button class="btn btn-sm btn-primary" onclick="uploadFile()">
+                                <i class="fas fa-upload me-1"></i>Upload Files
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <h6><i class="fas fa-comments me-2"></i>Comments</h6>
+                        <div id="comments-list" class="mb-3" style="max-height: 300px; overflow-y: auto;"></div>
+                        <div class="input-group">
+                            <input type="text" id="commentInput" class="form-control" placeholder="Add a comment..." onkeypress="if(event.keyCode==13) addComment()">
+                            <button class="btn btn-primary" onclick="addComment()">
+                                <i class="fas fa-paper-plane"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-4">
+            <div class="card mb-3">
+                <div class="card-header bg-secondary text-white">
+                    <h6 class="mb-0"><i class="fas fa-info-circle me-2"></i>Task Details</h6>
+                </div>
+                <div class="card-body">
+                    <p><strong>Created:</strong> {{ task.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+                    <p><strong>Updated:</strong> {{ task.updated_at.strftime('%Y-%m-%d %H:%M') }}</p>
+                    <p><strong>Column:</strong> {{ task.column.name }}</p>
+                    <hr>
+                    
+                    <label class="form-label"><strong>Change Due Date</strong></label>
+                    <input type="datetime-local" id="dueDateInput" class="form-control mb-2" 
+                           value="{{ task.due_date.strftime('%Y-%m-%dT%H:%M') if task.due_date else '' }}">
+                    <button class="btn btn-sm btn-warning w-100 mb-3" onclick="updateDueDate()">
+                        <i class="fas fa-calendar-check me-1"></i>Update Due Date
+                    </button>
+                    
+                    <label class="form-label"><strong>Change Priority</strong></label>
+                    <select id="prioritySelect" class="form-select mb-2">
+                        <option value="low" {% if task.priority == 'low' %}selected{% endif %}>🟢 Low Priority</option>
+                        <option value="medium" {% if task.priority == 'medium' %}selected{% endif %}>🟡 Medium Priority</option>
+                        <option value="high" {% if task.priority == 'high' %}selected{% endif %}>🔴 High Priority</option>
+                    </select>
+                    <button class="btn btn-sm btn-warning w-100" onclick="updatePriority()">
+                        <i class="fas fa-flag me-1"></i>Update Priority
+                    </button>
+                </div>
+            </div>
+            
+            <div class="card">
+                <div class="card-header bg-info text-white">
+                    <h6 class="mb-0"><i class="fas fa-chart-line me-2"></i>Progress</h6>
+                </div>
+                <div class="card-body text-center">
+                    {% if task.completed_at %}
+                        <i class="fas fa-check-circle text-success" style="font-size: 48px;"></i>
+                        <h5 class="mt-2 text-success">Completed!</h5>
+                        <p>Completed on {{ task.completed_at.strftime('%Y-%m-%d') }}</p>
+                    {% else %}
+                        <i class="fas fa-spinner fa-pulse text-primary" style="font-size: 48px;"></i>
+                        <h5 class="mt-2">In Progress</h5>
+                        <button class="btn btn-success mt-2" onclick="markComplete()">
+                            <i class="fas fa-check me-1"></i>Mark as Complete
+                        </button>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const taskId = {{ task.id }};
+
+function loadAttachments() {
+    $.ajax({
+        url: `/api/tasks/${taskId}/attachments`,
+        method: 'GET',
+        success: function(attachments) {
+            const container = $('#attachments-list');
+            if (attachments && attachments.length > 0) {
+                let html = '<div class="list-group">';
+                attachments.forEach(att => {
+                    const fileSize = formatFileSize(att.file_size);
+                    const isImage = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].includes(att.file_type);
+                    
+                    html += `
+                        <div class="list-group-item d-flex justify-content-between align-items-center">
+                            <div class="d-flex align-items-center">
+                                ${isImage ? 
+                                    `<img src="${att.url}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 4px;" class="me-2">` :
+                                    `<i class="fas ${att.icon} fa-2x text-${att.color} me-2"></i>`
+                                }
+                                <div>
+                                    <a href="${att.url}" target="_blank">${escapeHtml(att.filename)}</a>
+                                    <br><small class="text-muted">${fileSize}</small>
+                                </div>
+                            </div>
+                            <button class="btn btn-sm btn-danger" onclick="deleteAttachment(${att.id})">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+                container.html(html);
+            } else {
+                container.html('<p class="text-muted">No attachments</p>');
+            }
+        }
+    });
+}
+
+function loadComments() {
+    $.ajax({
+        url: `/api/tasks/${taskId}/comments`,
+        method: 'GET',
+        success: function(comments) {
+            const container = $('#comments-list');
+            if (comments && comments.length > 0) {
+                let html = '';
+                comments.forEach(comment => {
+                    html += `
+                        <div class="card mb-2">
+                            <div class="card-body py-2">
+                                <strong>${escapeHtml(comment.username)}</strong>
+                                <small class="text-muted ms-2">${comment.created_at}</small>
+                                <p class="mb-0 mt-1">${escapeHtml(comment.content)}</p>
+                            </div>
+                        </div>
+                    `;
+                });
+                container.html(html);
+            } else {
+                container.html('<p class="text-muted">No comments yet. Be the first to comment!</p>');
+            }
+        }
+    });
+}
+
+function uploadFile() {
+    const fileInput = document.getElementById('fileInput');
+    const files = fileInput.files;
+    
+    if (files.length === 0) {
+        alert('Please select a file to upload');
+        return;
+    }
+    
+    for (let i = 0; i < files.length; i++) {
+        const formData = new FormData();
+        formData.append('file', files[i]);
+        
+        $.ajax({
+            url: `/api/tasks/${taskId}/attachments`,
+            method: 'POST',
+            data: formData,
+            processData: false,
+            contentType: false,
+            success: function() {
+                showNotification('File uploaded successfully!', 'success');
+                loadAttachments();
+                fileInput.value = '';
+            },
+            error: function(xhr) {
+                showNotification('Error uploading file', 'danger');
+            }
+        });
+    }
+}
+
+function deleteAttachment(attachmentId) {
+    if (confirm('Are you sure you want to delete this attachment?')) {
+        $.ajax({
+            url: `/api/attachments/${attachmentId}`,
+            method: 'DELETE',
+            success: function() {
+                showNotification('Attachment deleted', 'info');
+                loadAttachments();
+            }
+        });
+    }
+}
+
+function addComment() {
+    const content = $('#commentInput').val();
+    if (!content.trim()) {
+        alert('Please enter a comment');
+        return;
+    }
+    
+    $.ajax({
+        url: `/api/tasks/${taskId}/comments`,
+        method: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({content: content}),
+        success: function() {
+            $('#commentInput').val('');
+            loadComments();
+            showNotification('Comment added!', 'success');
+        }
+    });
+}
+
+function updateDueDate() {
+    const dueDate = $('#dueDateInput').val();
+    
+    $.ajax({
+        url: `/api/tasks/${taskId}`,
+        method: 'PUT',
+        contentType: 'application/json',
+        data: JSON.stringify({due_date: dueDate}),
+        success: function() {
+            showNotification('Due date updated!', 'success');
+            setTimeout(() => location.reload(), 1000);
+        }
+    });
+}
+
+function updatePriority() {
+    const priority = $('#prioritySelect').val();
+    
+    $.ajax({
+        url: `/api/tasks/${taskId}`,
+        method: 'PUT',
+        contentType: 'application/json',
+        data: JSON.stringify({priority: priority}),
+        success: function() {
+            showNotification('Priority updated!', 'success');
+            setTimeout(() => location.reload(), 1000);
+        }
+    });
+}
+
+function markComplete() {
+    if (confirm('Mark this task as complete?')) {
+        // Get the Done column ID (assuming it's the 3rd column - index 2)
+        $.ajax({
+            url: `/api/tasks/${taskId}/move`,
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({column_id: 3}), // Assuming Done column has ID 3
+            success: function() {
+                showNotification('Task completed! 🎉', 'success');
+                setTimeout(() => location.reload(), 1000);
+            }
+        });
+    }
+}
+
+function formatFileSize(bytes) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    return text.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    });
+}
+
+function showNotification(message, type) {
+    const notification = $(`
+        <div class="alert alert-${type} alert-dismissible fade show position-fixed top-0 end-0 m-3" style="z-index: 9999; min-width: 300px;" role="alert">
+            <i class="fas fa-${type === 'success' ? 'check-circle' : 'exclamation-circle'} me-2"></i>
+            ${message}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+    `);
+    $('body').append(notification);
+    setTimeout(() => notification.remove(), 3000);
+}
+
+// Load data on page load
+$(document).ready(function() {
+    loadAttachments();
+    loadComments();
+});
+</script>
+{% endblock %}

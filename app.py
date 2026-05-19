@@ -1,0 +1,740 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_wtf import FlaskForm
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, JWTManager
+from wtforms import StringField, PasswordField, SubmitField, BooleanField
+from wtforms.validators import DataRequired, Email, Length, EqualTo, ValidationError
+from datetime import datetime, timedelta
+from werkzeug.utils import secure_filename
+import bcrypt
+import re
+import os
+import uuid
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+
+# ==================== CONFIGURATION ====================
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'jwt-secret-change-in-production')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///trello.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# File upload configuration
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['ALLOWED_EXTENSIONS'] = {
+    'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp',
+    'pdf', 'doc', 'docx', 'txt', 'xls', 'xlsx',
+    'ppt', 'pptx', 'zip', 'rar', 'mp4', 'mp3'
+}
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# ==================== EXTENSIONS ====================
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please log in to access this page.'
+
+# Rate Limiting (using memory storage - works without Redis)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+# JWT Manager
+jwt = JWTManager(app)
+
+# ==================== SECURITY HEADERS MIDDLEWARE ====================
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    # Relaxed CSP for development - allows all CDNs
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self' http://localhost:5000 https:; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https: http:; "
+        "style-src 'self' 'unsafe-inline' https: http:; "
+        "font-src 'self' https: http: data:; "
+        "img-src 'self' https: http: data: blob:; "
+        "connect-src 'self' http://localhost:5000 https:;"
+    )
+    return response
+
+# ==================== HELPER FUNCTIONS ====================
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def get_file_icon(filename):
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    image_exts = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
+    pdf_exts = {'pdf'}
+    word_exts = {'doc', 'docx'}
+    excel_exts = {'xls', 'xlsx'}
+    
+    if ext in image_exts:
+        return 'fa-file-image'
+    elif ext in pdf_exts:
+        return 'fa-file-pdf'
+    elif ext in word_exts:
+        return 'fa-file-word'
+    elif ext in excel_exts:
+        return 'fa-file-excel'
+    else:
+        return 'fa-file'
+
+def get_file_color(filename):
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    if ext in {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}:
+        return 'primary'
+    elif ext in {'pdf'}:
+        return 'danger'
+    elif ext in {'doc', 'docx'}:
+        return 'info'
+    elif ext in {'xls', 'xlsx'}:
+        return 'success'
+    else:
+        return 'secondary'
+
+# ==================== MODELS ====================
+class User(UserMixin, db.Model):
+    __tablename__ = 'users'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    avatar = db.Column(db.String(500), nullable=True)
+    
+    boards = db.relationship('Board', backref='owner', lazy=True)
+    created_tasks = db.relationship('Task', foreign_keys='Task.created_by_id', backref='creator', lazy=True)
+    assigned_tasks = db.relationship('Task', foreign_keys='Task.assignee_id', backref='assignee', lazy=True)
+    notifications = db.relationship('Notification', backref='user', lazy=True, cascade='all, delete-orphan')
+    
+    def set_password(self, password):
+        salt = bcrypt.gensalt()
+        self.password_hash = bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    
+    def check_password(self, password):
+        return bcrypt.checkpw(password.encode('utf-8'), self.password_hash.encode('utf-8'))
+
+class Board(db.Model):
+    __tablename__ = 'boards'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(500))
+    owner_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    columns = db.relationship('Column', backref='board', lazy=True, cascade='all, delete-orphan')
+
+class Column(db.Model):
+    __tablename__ = 'columns'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False)
+    order = db.Column(db.Integer, default=0)
+    board_id = db.Column(db.Integer, db.ForeignKey('boards.id'), nullable=False)
+    
+    tasks = db.relationship('Task', backref='column', lazy=True, cascade='all, delete-orphan')
+
+class Task(db.Model):
+    __tablename__ = 'tasks'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    priority = db.Column(db.String(10), default='medium')
+    due_date = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    
+    column_id = db.Column(db.Integer, db.ForeignKey('columns.id'), nullable=False)
+    assignee_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    created_by_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    
+    attachments = db.relationship('Attachment', backref='task', lazy=True, cascade='all, delete-orphan')
+    comments = db.relationship('Comment', backref='task', lazy=True, cascade='all, delete-orphan')
+    
+    def is_overdue(self):
+        if self.due_date and not self.completed_at:
+            return datetime.utcnow() > self.due_date
+        return False
+
+class Attachment(db.Model):
+    __tablename__ = 'attachments'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    file_path = db.Column(db.String(500), nullable=False)
+    file_size = db.Column(db.Integer, default=0)
+    file_type = db.Column(db.String(100))
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+    task_id = db.Column(db.Integer, db.ForeignKey('tasks.id'), nullable=False)
+    uploaded_by_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+
+class Comment(db.Model):
+    __tablename__ = 'comments'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    task_id = db.Column(db.Integer, db.ForeignKey('tasks.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    
+    user = db.relationship('User', backref='comments')
+
+class Notification(db.Model):
+    __tablename__ = 'notifications'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    message = db.Column(db.String(500), nullable=False)
+    type = db.Column(db.String(50), default='info')
+    is_read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    task_id = db.Column(db.Integer, db.ForeignKey('tasks.id'), nullable=True)
+
+# ==================== FORMS ====================
+class LoginForm(FlaskForm):
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    password = PasswordField('Password', validators=[DataRequired()])
+    remember_me = BooleanField('Remember Me')
+    submit = SubmitField('Sign In')
+
+class RegistrationForm(FlaskForm):
+    username = StringField('Username', validators=[DataRequired(), Length(min=3, max=80)])
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    password = PasswordField('Password', validators=[DataRequired(), Length(min=6)])
+    password2 = PasswordField('Confirm Password', validators=[DataRequired(), EqualTo('password')])
+    submit = SubmitField('Register')
+    
+    def validate_username(self, username):
+        if not re.match(r'^[a-zA-Z0-9_]+$', username.data):
+            raise ValidationError('Username can only contain letters, numbers, and underscores')
+
+# ==================== USER LOADER ====================
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# ==================== JWT API ENDPOINTS ====================
+@app.route('/api/login', methods=['POST'])
+@limiter.limit("10 per minute")
+def api_login():
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Missing JSON body'}), 400
+    
+    email = data.get('email')
+    password = data.get('password')
+    
+    if not email or not password:
+        return jsonify({'error': 'Email and password required'}), 400
+    
+    user = User.query.filter_by(email=email).first()
+    
+    if user and user.check_password(password):
+        access_token = create_access_token(identity=str(user.id))
+        return jsonify({
+            'access_token': access_token,
+            'token_type': 'bearer',
+            'user_id': user.id,
+            'username': user.username,
+            'email': user.email,
+            'is_admin': user.is_admin
+        }), 200
+    else:
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+@app.route('/api/protected', methods=['GET'])
+@jwt_required()
+def api_protected():
+    current_user_id = get_jwt_identity()
+    user = User.query.get(int(current_user_id))
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify({
+        'message': f'Authenticated as {user.email}',
+        'user_id': user.id,
+        'username': user.username,
+        'is_admin': user.is_admin
+    }), 200
+
+@app.route('/api/me', methods=['GET'])
+@jwt_required()
+def api_me():
+    current_user_id = get_jwt_identity()
+    user = User.query.get(int(current_user_id))
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify({
+        'id': user.id,
+        'username': user.username,
+        'email': user.email,
+        'is_admin': user.is_admin,
+        'created_at': user.created_at.isoformat()
+    }), 200
+
+# ==================== WEB ROUTES ====================
+@app.route('/')
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("10 per minute")
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        if user and user.check_password(form.password.data):
+            login_user(user, remember=form.remember_me.data)
+            flash('Logged in successfully!', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid email or password', 'danger')
+    return render_template('login.html', form=form)
+
+@app.route('/register', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        existing_user = User.query.filter(
+            (User.email == form.email.data) | (User.username == form.username.data)
+        ).first()
+        if existing_user:
+            flash('User already exists', 'danger')
+            return render_template('register.html', form=form)
+        
+        user = User(username=form.username.data, email=form.email.data)
+        user.set_password(form.password.data)
+        db.session.add(user)
+        db.session.commit()
+        flash('Registration successful! Please log in.', 'success')
+        return redirect(url_for('login'))
+    return render_template('register.html', form=form)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    user_boards = Board.query.filter_by(owner_id=current_user.id).all()
+    
+    upcoming_tasks = Task.query.filter(
+        Task.assignee_id == current_user.id,
+        Task.due_date.isnot(None),
+        Task.completed_at.is_(None),
+        Task.due_date > datetime.utcnow()
+    ).order_by(Task.due_date).limit(5).all()
+    
+    overdue_tasks = Task.query.filter(
+        Task.assignee_id == current_user.id,
+        Task.due_date.isnot(None),
+        Task.completed_at.is_(None),
+        Task.due_date < datetime.utcnow()
+    ).all()
+    
+    unread_notifications = Notification.query.filter_by(user_id=current_user.id, is_read=False).count()
+    
+    return render_template('dashboard.html', 
+                         boards=user_boards, 
+                         upcoming_tasks=upcoming_tasks,
+                         overdue_tasks=overdue_tasks,
+                         unread_notifications=unread_notifications)
+
+@app.route('/board/<int:board_id>')
+@login_required
+def view_board(board_id):
+    board = Board.query.get_or_404(board_id)
+    if board.owner_id != current_user.id and not current_user.is_admin:
+        flash('Access denied', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    columns = Column.query.filter_by(board_id=board_id).order_by(Column.order).all()
+    return render_template('board.html', board=board, columns=columns)
+
+@app.route('/task/<int:task_id>')
+@login_required
+def view_task(task_id):
+    task = Task.query.get_or_404(task_id)
+    board = Board.query.get(task.column.board_id)
+    
+    if board.owner_id != current_user.id and not current_user.is_admin:
+        flash('Access denied', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    return render_template('task_detail.html', task=task, board=board)
+
+@app.route('/uploads/<filename>')
+@login_required
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# ==================== API ROUTES (CRUD) ====================
+@app.route('/api/tasks/<int:task_id>/attachments', methods=['POST'])
+@login_required
+def upload_attachment(task_id):
+    task = Task.query.get_or_404(task_id)
+    
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'File type not allowed'}), 400
+    
+    original_filename = file.filename
+    ext = original_filename.rsplit('.', 1)[1].lower() if '.' in original_filename else ''
+    unique_filename = f"{uuid.uuid4().hex}.{ext}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+    
+    file.save(file_path)
+    file_size = os.path.getsize(file_path)
+    
+    attachment = Attachment(
+        filename=unique_filename,
+        original_filename=original_filename,
+        file_path=file_path,
+        file_size=file_size,
+        file_type=ext,
+        task_id=task_id,
+        uploaded_by_id=current_user.id
+    )
+    
+    db.session.add(attachment)
+    db.session.commit()
+    
+    return jsonify({
+        'id': attachment.id,
+        'filename': original_filename,
+        'file_size': file_size,
+        'file_type': ext,
+        'icon': get_file_icon(original_filename),
+        'color': get_file_color(original_filename),
+        'uploaded_at': attachment.uploaded_at.strftime('%Y-%m-%d %H:%M'),
+        'url': url_for('uploaded_file', filename=unique_filename)
+    }), 201
+
+@app.route('/api/attachments/<int:attachment_id>', methods=['DELETE'])
+@login_required
+def delete_attachment(attachment_id):
+    attachment = Attachment.query.get_or_404(attachment_id)
+    task = Task.query.get(attachment.task_id)
+    
+    if task.created_by_id != current_user.id and not current_user.is_admin:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    if os.path.exists(attachment.file_path):
+        os.remove(attachment.file_path)
+    
+    db.session.delete(attachment)
+    db.session.commit()
+    return jsonify({'message': 'Attachment deleted'}), 200
+
+@app.route('/api/tasks/<int:task_id>/attachments', methods=['GET'])
+@login_required
+def get_attachments(task_id):
+    attachments = Attachment.query.filter_by(task_id=task_id).all()
+    return jsonify([{
+        'id': a.id,
+        'filename': a.original_filename,
+        'file_size': a.file_size,
+        'file_type': a.file_type,
+        'icon': get_file_icon(a.original_filename),
+        'color': get_file_color(a.original_filename),
+        'uploaded_at': a.uploaded_at.strftime('%Y-%m-%d %H:%M'),
+        'url': url_for('uploaded_file', filename=a.filename)
+    } for a in attachments])
+
+@app.route('/api/tasks/<int:task_id>/comments', methods=['GET'])
+@login_required
+def get_comments(task_id):
+    comments = Comment.query.filter_by(task_id=task_id).order_by(Comment.created_at.desc()).all()
+    return jsonify([{
+        'id': c.id,
+        'content': c.content,
+        'created_at': c.created_at.strftime('%Y-%m-%d %H:%M'),
+        'username': c.user.username,
+        'user_id': c.user_id
+    } for c in comments])
+
+@app.route('/api/tasks/<int:task_id>/comments', methods=['POST'])
+@login_required
+def add_comment(task_id):
+    data = request.get_json()
+    comment = Comment(
+        content=data['content'],
+        task_id=task_id,
+        user_id=current_user.id
+    )
+    db.session.add(comment)
+    db.session.commit()
+    
+    task = Task.query.get(task_id)
+    if task.created_by_id != current_user.id:
+        notification = Notification(
+            message=f"{current_user.username} commented on task: {task.title}",
+            type='info',
+            user_id=task.created_by_id,
+            task_id=task_id
+        )
+        db.session.add(notification)
+        db.session.commit()
+    
+    return jsonify({'message': 'Comment added'}), 201
+
+@app.route('/api/boards', methods=['POST'])
+@login_required
+def create_board():
+    data = request.get_json()
+    board = Board(name=data['name'], description=data.get('description', ''), owner_id=current_user.id)
+    db.session.add(board)
+    db.session.commit()
+    
+    default_columns = ['To Do', 'In Progress', 'Done']
+    for i, col_name in enumerate(default_columns):
+        column = Column(name=col_name, order=i, board_id=board.id)
+        db.session.add(column)
+    db.session.commit()
+    
+    return jsonify({'id': board.id, 'name': board.name, 'description': board.description})
+
+@app.route('/api/boards/<int:board_id>', methods=['DELETE'])
+@login_required
+def delete_board(board_id):
+    board = Board.query.get_or_404(board_id)
+    if board.owner_id != current_user.id and not current_user.is_admin:
+        return jsonify({'error': 'Unauthorized'}), 403
+    db.session.delete(board)
+    db.session.commit()
+    return jsonify({'message': 'Board deleted'})
+
+@app.route('/api/columns/<int:column_id>/tasks', methods=['POST'])
+@login_required
+def create_task(column_id):
+    data = request.get_json()
+    task = Task(
+        title=data['title'],
+        description=data.get('description', ''),
+        priority=data.get('priority', 'medium'),
+        column_id=column_id,
+        created_by_id=current_user.id,
+        assignee_id=data.get('assignee_id', current_user.id)
+    )
+    
+    if data.get('due_date'):
+        task.due_date = datetime.fromisoformat(data['due_date'])
+    
+    db.session.add(task)
+    db.session.commit()
+    
+    return jsonify({'id': task.id, 'title': task.title, 'description': task.description, 'priority': task.priority})
+
+@app.route('/api/tasks/<int:task_id>', methods=['GET'])
+@login_required
+def get_task(task_id):
+    task = Task.query.get_or_404(task_id)
+    return jsonify({
+        'id': task.id,
+        'title': task.title,
+        'description': task.description,
+        'priority': task.priority,
+        'due_date': task.due_date.isoformat() if task.due_date else None,
+        'column_id': task.column_id,
+        'assignee_id': task.assignee_id,
+        'created_at': task.created_at.isoformat(),
+        'completed_at': task.completed_at.isoformat() if task.completed_at else None
+    })
+
+@app.route('/api/tasks/<int:task_id>', methods=['PUT'])
+@login_required
+def update_task(task_id):
+    task = Task.query.get_or_404(task_id)
+    data = request.get_json()
+    
+    if 'title' in data:
+        task.title = data['title']
+    if 'description' in data:
+        task.description = data['description']
+    if 'priority' in data:
+        task.priority = data['priority']
+    
+    if 'due_date' in data and data['due_date']:
+        task.due_date = datetime.fromisoformat(data['due_date'])
+    
+    db.session.commit()
+    return jsonify({'message': 'Task updated'})
+
+@app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
+@login_required
+def delete_task(task_id):
+    task = Task.query.get_or_404(task_id)
+    for attachment in task.attachments:
+        if os.path.exists(attachment.file_path):
+            os.remove(attachment.file_path)
+    db.session.delete(task)
+    db.session.commit()
+    return jsonify({'message': 'Task deleted'})
+
+@app.route('/api/tasks/<int:task_id>/move', methods=['POST'])
+@login_required
+def move_task(task_id):
+    task = Task.query.get_or_404(task_id)
+    data = request.get_json()
+    task.column_id = data['column_id']
+    
+    new_column = Column.query.get(data['column_id'])
+    if new_column and new_column.name == 'Done':
+        task.completed_at = datetime.utcnow()
+    elif task.completed_at:
+        task.completed_at = None
+    
+    db.session.commit()
+    return jsonify({'message': 'Task moved'})
+
+@app.route('/api/notifications', methods=['GET'])
+@login_required
+def get_notifications():
+    notifications = Notification.query.filter_by(user_id=current_user.id).order_by(Notification.created_at.desc()).limit(20).all()
+    return jsonify([{
+        'id': n.id,
+        'message': n.message,
+        'type': n.type,
+        'is_read': n.is_read,
+        'created_at': n.created_at.strftime('%Y-%m-%d %H:%M'),
+        'task_id': n.task_id
+    } for n in notifications])
+
+@app.route('/api/notifications/<int:notification_id>/read', methods=['POST'])
+@login_required
+def mark_notification_read(notification_id):
+    notification = Notification.query.get_or_404(notification_id)
+    if notification.user_id != current_user.id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    notification.is_read = True
+    db.session.commit()
+    return jsonify({'message': 'Marked as read'})
+
+@app.route('/api/notifications/mark-all-read', methods=['POST'])
+@login_required
+def mark_all_notifications_read():
+    Notification.query.filter_by(user_id=current_user.id, is_read=False).update({'is_read': True})
+    db.session.commit()
+    return jsonify({'message': 'All notifications marked as read'})
+
+# ==================== ADMIN ROUTES ====================
+@app.route('/admin')
+@login_required
+def admin_dashboard():
+    if not current_user.is_admin:
+        flash('Admin access required', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    users = User.query.all()
+    boards = Board.query.all()
+    tasks = Task.query.all()
+    attachments = Attachment.query.all()
+    
+    stats = {
+        'total_users': len(users),
+        'total_boards': len(boards),
+        'total_tasks': len(tasks),
+        'total_attachments': len(attachments),
+        'admin_users': len([u for u in users if u.is_admin]),
+        'completed_tasks': len([t for t in tasks if t.completed_at]),
+        'overdue_tasks': len([t for t in tasks if t.is_overdue()])
+    }
+    
+    return render_template('admin.html', users=users, boards=boards, stats=stats)
+
+@app.route('/admin/users/<int:user_id>/toggle-admin', methods=['POST'])
+@login_required
+def toggle_admin(user_id):
+    if not current_user.is_admin:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    user = User.query.get_or_404(user_id)
+    if user.id == current_user.id:
+        return jsonify({'error': 'Cannot change own admin status'}), 400
+    
+    user.is_admin = not user.is_admin
+    db.session.commit()
+    return jsonify({'is_admin': user.is_admin})
+
+@app.route('/admin/users/<int:user_id>/delete', methods=['DELETE'])
+@login_required
+def delete_user(user_id):
+    if not current_user.is_admin:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    user = User.query.get_or_404(user_id)
+    if user.id == current_user.id:
+        return jsonify({'error': 'Cannot delete yourself'}), 400
+    
+    db.session.delete(user)
+    db.session.commit()
+    return jsonify({'message': 'User deleted'})
+
+# ==================== HEALTH CHECK ====================
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}), 200
+
+# ==================== DATABASE INITIALIZATION ====================
+with app.app_context():
+    db.create_all()
+    
+    # Create admin user if not exists
+    admin = User.query.filter_by(email='admin@example.com').first()
+    if not admin:
+        admin = User(username='admin', email='admin@example.com', is_admin=True)
+        admin.set_password('admin123')
+        db.session.add(admin)
+        db.session.commit()
+    
+    print("=" * 50)
+    print("DATABASE SETUP COMPLETE!")
+    print("=" * 50)
+    print("Admin User Credentials:")
+    print("  Email: admin@example.com")
+    print("  Password: admin123")
+    print("=" * 50)
+    print("The application is ready to use!")
+    print("Open http://127.0.0.1:5000 in your browser")
+    print("=" * 50)
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
