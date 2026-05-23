@@ -39,24 +39,26 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ap-south-1
-    
-    - name: Deploy to EC2 via SSM
+    - name: Setup SSH key
       run: |
-        INSTANCE_ID=$(aws ec2 describe-instances \
-          --filters "Name=tag:Name,Values=trello-app-server" "Name=instance-state-name,Values=running" \
-          --query "Reservations[0].Instances[0].InstanceId" \
-          --output text)
-        
-        aws ssm send-command \
-          --instance-ids "$INSTANCE_ID" \
-          --document-name "AWS-RunShellScript" \
-          --parameters commands=["sudo /usr/local/bin/deploy-from-github.sh"] \
-          --comment "Deploy latest code from GitHub"
-        
-        echo "✅ Deployment triggered successfully"
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        echo "${{ secrets.BASTION_IP }}" > ~/.ssh/bastion_ip
+    
+    - name: Deploy to EC2 via Bastion
+      run: |
+        # Connect to Bastion, then to private EC2, and deploy
+        ssh -o StrictHostKeyChecking=no -J ubuntu@${{ secrets.BASTION_IP }} ubuntu@10.0.3.194 '
+          cd /home/ubuntu/app
+          echo "Pulling latest code..."
+          git pull https://github.com/AmbadySanthosh/trello-clone-capstone.git main
+          echo "Activating virtual environment..."
+          source venv/bin/activate
+          echo "Installing dependencies..."
+          pip install -r requirements.txt
+          echo "Restarting services..."
+          sudo systemctl restart trello
+          sudo systemctl restart nginx
+          echo "✅ Deployment completed at $(date)"
+        '
