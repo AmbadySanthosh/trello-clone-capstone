@@ -42,23 +42,29 @@ jobs:
     - name: Setup SSH key
       run: |
         mkdir -p ~/.ssh
-        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        echo "${{ secrets.BASTION_IP }}" > ~/.ssh/bastion_ip
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/trello-key.pem
+        chmod 600 ~/.ssh/trello-key.pem
+    
+    - name: Add Bastion to known hosts
+      run: |
+        ssh-keyscan -H "${{ secrets.BASTION_IP }}" >> ~/.ssh/known_hosts
+      continue-on-error: true
     
     - name: Deploy to EC2 via Bastion
       run: |
-        # Connect to Bastion, then to private EC2, and deploy
-        ssh -o StrictHostKeyChecking=no -J ubuntu@${{ secrets.BASTION_IP }} ubuntu@10.0.3.194 '
-          cd /home/ubuntu/app
-          echo "Pulling latest code..."
-          git pull https://github.com/AmbadySanthosh/trello-clone-capstone.git main
-          echo "Activating virtual environment..."
-          source venv/bin/activate
-          echo "Installing dependencies..."
-          pip install -r requirements.txt
-          echo "Restarting services..."
-          sudo systemctl restart trello
-          sudo systemctl restart nginx
-          echo "✅ Deployment completed at $(date)"
+        # First SSH to Bastion, then to private EC2
+        ssh -i ~/.ssh/trello-key.pem -o StrictHostKeyChecking=accept-new ubuntu@${{ secrets.BASTION_IP }} '
+          ssh -o StrictHostKeyChecking=accept-new ubuntu@10.0.3.194 '\''
+            cd /home/ubuntu/app
+            echo "Pulling latest code..."
+            git pull https://github.com/AmbadySanthosh/trello-clone-capstone.git main
+            echo "Activating virtual environment..."
+            source venv/bin/activate
+            echo "Installing dependencies..."
+            pip install -r requirements.txt
+            echo "Restarting services..."
+            sudo systemctl restart trello
+            sudo systemctl restart nginx
+            echo "✅ Deployment completed at $(date)"
+          '\''
         '
