@@ -3,8 +3,6 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 jobs:
   test:
@@ -25,17 +23,13 @@ jobs:
         pip install flake8 bandit
     
     - name: Lint with flake8
-      run: |
-        flake8 app.py --max-line-length=120 --ignore=E501,W503 || true
+      run: flake8 app.py --max-line-length=120 --ignore=E501,W503 || true
     
     - name: Security scan with bandit
-      run: |
-        bandit -r . -f txt -o bandit_report.txt || true
-        cat bandit_report.txt
+      run: bandit -r . -f txt -o bandit_report.txt || true
     
     - name: Verify app imports
-      run: |
-        python -c "import app; print('✅ App loads successfully')"
+      run: python -c "import app; print('✅ App loads successfully')"
 
   deploy:
     needs: test
@@ -52,8 +46,17 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ap-south-1
     
-    - name: Deploy notification
+    - name: Deploy to EC2 via SSM
       run: |
-        echo "✅ CI/CD Pipeline Complete"
-        echo "Tests passed. Ready for deployment to EC2."
-        echo "Deployment timestamp: $(date)"
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=trello-app-server" "Name=instance-state-name,Values=running" \
+          --query "Reservations[0].Instances[0].InstanceId" \
+          --output text)
+        
+        aws ssm send-command \
+          --instance-ids "$INSTANCE_ID" \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands=["sudo /usr/local/bin/deploy-from-github.sh"] \
+          --comment "Deploy latest code from GitHub"
+        
+        echo "✅ Deployment triggered successfully"
